@@ -1,0 +1,304 @@
+"""
+simple_exchange_bot.py
+
+- Requires: ccxt (pip install ccxt)
+- Usage: set your API keys and config below, then run: python simple_exchange_bot.py
+- Behavior: If no buy position exists (according to the simple position-tracking used here),
+  it places a market BUY of `order_quantity` (base units), then watches the ticker.
+  If price >= TP_price -> it closes the position with a market SELL.
+  If price <= SL_price -> it closes the position with a market SELL.
+
+Note: This script uses a simple approach (monitor & market-close). Some exchanges
+support TP/SL OCO orders; you can adapt code to use exchange.create_order with
+stop/take-profit params if desired AND supported by that exchange.
+"""
+
+import ccxt
+import time
+import math
+import sys
+import traceback
+from datetime import datetime
+
+# ---------------------------
+# CONFIG — edit these values
+# ---------------------------
+EXCHANGE_ID = "binance"          # example: "binance", "bybit", "kraken" (must be in ccxt)
+USE_TESTNET = False              # set True for testnet if supported (see notes below)
+API_KEY = "YOUR_API_KEY"
+API_SECRET = "YOUR_API_SECRET"
+
+SYMBOL = "BTC/USDT"              # trading symbol in ccxt format
+MARKET_TYPE = "spot"             # "spot" or "futures" (for futures adjust exchange params if needed)
+ORDER_QUANTITY = 0.01            # base currency quantity to BUY (example: 0.01 BTC)
+TP_PERCENT = 0.50                # 0.50 %
+SL_PERCENT = 0.10                # 0.10 %
+POLL_INTERVAL = 1.0              # seconds between ticker checks
+DRY_RUN = True                   # True -> do not send real orders, only simulate/log
+MAX_RETRIES = 5                  # for transient API errors
+
+# Optional: limit one trade per symbol per run
+ONLY_ONE_TRADE_PER_RUN = True
+
+# ---------------------------
+# Helper functions
+# ---------------------------
+
+def now():
+    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+def safe_print(*args, **kwargs):
+    print(f"[{now()}]", *args, **kwargs)
+
+def calc_tp_sl(entry_price, tp_percent, sl_percent):
+    # Step-by-step arithmetic (digit-checked style):
+    # TP factor = 1 + tp_percent/100
+    # SL factor = 1 - sl_percent/100
+    tp_factor = 1.0 + (tp_percent / 100.0)   # e.g., 1 + 0.50/100 = 1.005
+    sl_factor = 1.0 - (sl_percent / 100.0)   # e.g., 1 - 0.10/100 = 0.999
+    tp = entry_price * tp_factor
+    sl = entry_price * sl_factor
+    return tp, sl
+
+def to_precision(x, precision):
+    # precision = number of decimal places
+    fmt = "{:0." + str(precision) + "f}"
+    return float(fmt.format(x))
+
+# ---------------------------
+# Initialize exchange
+# ---------------------------
+
+def create_exchange():
+    if EXCHANGE_ID not in ccxt.exchanges:
+        raise ValueError(f"Exchange '{EXCHANGE_ID}' not found in ccxt.exchanges")
+
+    exchange_class = getattr(ccxt, EXCHANGE_ID)
+    params = {}
+    if EXCHANGE_ID == "binance" and USE_TESTNET:
+        # For binance testnet (spot) ccxt requires additional urls param
+        params['options'] = {'adjustForTimeDifference': True}
+        params['urls'] = {
+            'api': {
+                'public': 'https://testnet.binance.vision/api/v3',
+                'private': 'https://testnet.binance.vision/api/v3',
+            }
+        }
+
+    exchange = exchange_class({
+        'apiKey': API_KEY,
+        'secret': API_SECRET,
+        'enableRateLimit': True,
+        **params
+    })
+
+    # For futures on some exchanges you need extra config (example: binance.usdm)
+    if MARKET_TYPE == "futures":
+        if hasattr(exchange, 'set_sandbox_mode') and USE_TESTNET:
+            exchange.set_sandbox_mode(True)
+        # Binance futures example: 'binanceusdm' or pass options; user must pick proper ccxt id.
+    return exchange
+
+# ---------------------------
+# Core trading logic
+# ---------------------------
+
+def main():
+    safe_print("Starting bot (dry_run=%s)" % DRY_RUN)
+    try:
+        exchange = create_exchange()
+    except Exception as e:
+        safe_print("Error creating exchange:", e)
+        raise
+
+    # load markets
+    safe_print("Loading markets...")
+    exchange.load_markets()
+    if SYMBOL not in exchange.markets:
+        safe_print("Symbol not found on exchange:", SYMBOL)
+        safe_print("Available markets sample:", list(exchange.markets.keys())[:10])
+        return
+
+    market = exchange.markets[SYMBOL]
+    price_precision = market.get('precision', {}).get('price', 8)
+    amount_precision = market.get('precision', {}).get('amount', 8)
+    safe_print(f"Market loaded: {SYMBOL}, price_precision={price_precision}, amount_precision={amount_precision}")
+
+    # Basic check: do we already have an open buy position?
+    # NOTE: ccxt unified positions differ per exchange; for simplicity we will:
+    #   - For spot: check open orders & balances (no concept of 'position') — if we hold amount > 0 we consider 'position open'
+    #   - For futures: try to use fetch_positions (if provided) else fallback to fetch_balance
+    def has_open_buy_position():
+        try:
+            if MARKET_TYPE == "spot":
+                # Check base currency balance > ORDER_QUANTITY (or some threshold)
+                base_currency = market['base']
+                bal = exchange.fetch_balance()
+                free = bal.get(base_currency, {}).get('free', 0)
+                total = bal.get(base_currency, {}).get('total', 0)
+                safe_print(f"Balance {base_currency}: free={free}, total={total}")
+                # If free or total already >= ORDER_QUANTITY (plus small epsilon), consider position exists
+                if total >= (ORDER_QUANTITY * 0.9):  # lenient check
+                    return True
+                return False
+            else:
+                # Futures: try fetch_positions()
+                if hasattr(exchange, 'fetch_positions'):
+                    positions = exchange.fetch_positions([SYMBOL])
+                    for p in positions:
+                        # positions structure varies; check 'symbol' and 'contracts' or 'size' fields
+                        if p.get('symbol') == SYMBOL:
+                            size = p.get('contracts') or p.get('amount') or p.get('positionAmt') or 0
+                            if size and abs(float(size)) >= (ORDER_QUANTITY * 0.9):
+                                return True
+                # fallback: inspect balances for base currency
+                base_currency = market['base']
+                bal = exchange.fetch_balance()
+                total = bal.get(base_currency, {}).get('total', 0)
+                if total >= (ORDER_QUANTITY * 0.9):
+                    return True
+                return False
+        except Exception as e:
+            safe_print("Warning: error checking open position:", str(e))
+            return False
+
+    # Abide by ONLY_ONE_TRADE_PER_RUN flag
+    trade_done = False
+
+    # Main loop: poll tickers and place trade when no open position
+    try:
+        while True:
+            try:
+                ticker = exchange.fetch_ticker(SYMBOL)
+                ask = ticker.get('ask') or ticker.get('last')
+                bid = ticker.get('bid') or ticker.get('last')
+                last = ticker.get('last')
+                if ask is None:
+                    safe_print("No ask price available yet, skipping...")
+                    time.sleep(POLL_INTERVAL)
+                    continue
+
+                safe_print(f"Ticker: bid={bid} ask={ask} last={last}")
+
+                # If we already executed one trade in this run and ONLY_ONE_TRADE_PER_RUN -> break/idle
+                if ONLY_ONE_TRADE_PER_RUN and trade_done:
+                    safe_print("Trade already executed in this run and ONLY_ONE_TRADE_PER_RUN=True. Sleeping...")
+                    time.sleep(POLL_INTERVAL)
+                    continue
+
+                if has_open_buy_position():
+                    safe_print("Detected existing buy position → skipping new buy.")
+                    time.sleep(POLL_INTERVAL)
+                    continue
+
+                # Place market buy (or simulate if DRY_RUN)
+                entry_price = ask
+                entry_price = float(to_precision(entry_price, price_precision))
+                tp_price, sl_price = calc_tp_sl(entry_price, TP_PERCENT, SL_PERCENT)
+
+                # Normalize
+                tp_price = float(to_precision(tp_price, price_precision))
+                sl_price = float(to_precision(sl_price, price_precision))
+                quantity = float(to_precision(ORDER_QUANTITY, amount_precision))
+
+                safe_print(f"Preparing BUY: qty={quantity} entry={entry_price} TP={tp_price} SL={sl_price}")
+
+                if DRY_RUN:
+                    safe_print("[DRY RUN] Would place market BUY now.")
+                    simulated_order = {
+                        'id': 'dryrun-123',
+                        'timestamp': int(time.time() * 1000),
+                        'status': 'closed',
+                        'symbol': SYMBOL,
+                        'type': 'market',
+                        'side': 'buy',
+                        'price': entry_price,
+                        'amount': quantity
+                    }
+                    order = simulated_order
+                else:
+                    # Create market buy
+                    # For some exchanges you must pass symbol, amount, price=None for market
+                    order = None
+                    for attempt in range(MAX_RETRIES):
+                        try:
+                            order = exchange.create_market_buy_order(SYMBOL, quantity)
+                            break
+                        except Exception as e:
+                            safe_print(f"create_market_buy_order failed (attempt {attempt+1}): {e}")
+                            time.sleep(1 + attempt)
+                    if order is None:
+                        raise RuntimeError("Failed to create market buy order after retries.")
+
+                safe_print("BUY order executed:", order)
+                trade_done = True
+
+                # After buy, monitor price for TP/SL
+                safe_print("Entering monitoring loop for TP/SL...")
+                position_open = True
+                while position_open:
+                    ticker = exchange.fetch_ticker(SYMBOL)
+                    last_price = ticker.get('last') or ticker.get('close')
+                    if last_price is None:
+                        time.sleep(POLL_INTERVAL)
+                        continue
+                    last_price = float(last_price)
+
+                    safe_print(f"Watching price: last={last_price} TP={tp_price} SL={sl_price}")
+
+                    # TP triggered?
+                    if last_price >= tp_price:
+                        safe_print("TP triggered -> will close position with market SELL.")
+                        if DRY_RUN:
+                            safe_print("[DRY RUN] Would place market SELL to close at TP.")
+                        else:
+                            for attempt in range(MAX_RETRIES):
+                                try:
+                                    # market sell to close the bought amount
+                                    res = exchange.create_market_sell_order(SYMBOL, quantity)
+                                    safe_print("SELL (TP) order result:", res)
+                                    break
+                                except Exception as e:
+                                    safe_print(f"market_sell_order failed (attempt {attempt+1}): {e}")
+                                    time.sleep(1 + attempt)
+                        position_open = False
+                        break
+
+                    # SL triggered?
+                    if last_price <= sl_price:
+                        safe_print("SL triggered -> will close position with market SELL.")
+                        if DRY_RUN:
+                            safe_print("[DRY RUN] Would place market SELL to close at SL.")
+                        else:
+                            for attempt in range(MAX_RETRIES):
+                                try:
+                                    res = exchange.create_market_sell_order(SYMBOL, quantity)
+                                    safe_print("SELL (SL) order result:", res)
+                                    break
+                                except Exception as e:
+                                    safe_print(f"market_sell_order failed (attempt {attempt+1}): {e}")
+                                    time.sleep(1 + attempt)
+                        position_open = False
+                        break
+
+                    time.sleep(POLL_INTERVAL)
+
+                safe_print("Position closed by TP/SL. Looping for next trade...")
+
+                # If you want the bot to stop after one trade, uncomment break here:
+                # break
+
+            except KeyboardInterrupt:
+                safe_print("KeyboardInterrupt — exiting.")
+                break
+            except Exception as e:
+                safe_print("Unhandled exception in main loop:", e)
+                traceback.print_exc()
+                time.sleep(5)
+
+    finally:
+        safe_print("Bot stopped.")
+
+
+if __name__ == "__main__":
+    main()
